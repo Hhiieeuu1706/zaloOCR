@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Databases & local configs
+*.db
+*.db-journal
+*.sqlite
+zalo_bidder.db
+
+# Project logs and screenshots
+src/logs/
+src/screenshots/
+logs/
+screenshots/
+
+# Models directory (don't upload heavy downloaded models)
+models/
+
+# OS generated files
+.DS_Store
+Thumbs.db
