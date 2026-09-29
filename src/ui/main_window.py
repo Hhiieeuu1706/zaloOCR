@@ -225,12 +225,16 @@ class MainWindow(QMainWindow):
         self.draft_expected_price = None
         self.draft_observed_text = ""
         self.draft_candidate_text = None
+        self.draft_candidate_since = 0.0
         self.draft_stable_frames = 0
         self.draft_observed_at = 0.0
+        self.draft_ignore_until = 0.0
+        self.draft_last_repair_at = 0.0
+        self.draft_mismatch_key = None
+        self.draft_mismatch_locked_logged = False
         self.draft_generation = 0
         self.draft_repair_attempts = 0
         self.pending_bid_request = None
-        self.queued_prepare_price = None
         self.wait_confirm_generation = 0
         # pynput may emit repeated on_press events while Space is held. Keep a
         # key-down latch plus a short debounce so one physical press toggles
@@ -1000,9 +1004,8 @@ class MainWindow(QMainWindow):
         expected = self.draft_expected_price
         observed = self.draft_observed_text or ""
         colors = {
-            "ARMED": "#00ff66", "PREPARING": "#ffb703",
-            "SENDING": "#00d2ff", "WAIT_CONFIRM": "#00d2ff",
-            "MISMATCH": "#ff3333", "ERROR": "#ff3333", "EMPTY": "#aaaaaa",
+            "READY": "#00ff66", "PREPARING": "#ffb703",
+            "WAIT_CLEAR": "#00d2ff", "ERROR": "#ff3333", "EMPTY": "#aaaaaa",
         }
         color = colors.get(state, "#aaaaaa")
         if hasattr(self, "lbl_draft_status"):
@@ -1017,92 +1020,211 @@ class MainWindow(QMainWindow):
         self.draft_expected_price = None
         self.draft_observed_text = ""
         self.draft_candidate_text = None
+        self.draft_candidate_since = 0.0
         self.draft_stable_frames = 0
         self.draft_observed_at = 0.0
+        self.draft_ignore_until = 0.0
+        self.draft_last_repair_at = 0.0
+        self.draft_mismatch_key = None
+        self.draft_mismatch_locked_logged = False
         self.draft_repair_attempts = 0
         self.pending_bid_request = None
-        self.queued_prepare_price = None
         self.pre_typed_price = None
         self.bid_send_in_progress = False
         self.wait_confirm_generation += 1
         self._set_draft_state("EMPTY")
 
-    def _draft_is_armed(self, price):
+    def _draft_is_ready(self, price):
         return (
-            self.draft_state == "ARMED"
+            self.draft_state == "READY"
             and self.draft_expected_price == price
             and self.draft_observed_text == str(price)
             and self.draft_stable_frames >= 2
             and (time.monotonic() - self.draft_observed_at) <= 0.25
         )
 
+    def _write_input_text(self, text):
+        """The only OCR-mode path allowed to mutate the Zalo input editor."""
+        try:
+            ix, iy, iw, ih = self.config.input_zone
+            if ix <= 0 or iy <= 0:
+                self.log("[Draft Controller] Zalo input point is not configured.")
+                return False
+            dpr = self.ocr_worker.device_pixel_ratio
+            win32_click(int(round((ix + iw // 2) * dpr)), int(round((iy + ih // 2) * dpr)))
+            time.sleep(0.005)
+            press_win32_hotkey(VK_CONTROL, VK_A)
+            press_win32_key(VK_BACK, False)
+            press_win32_key(VK_BACK, True)
+            if text:
+                pyautogui.write(str(text), interval=0.0)
+            return True
+        except Exception as exc:
+            self.log(f"[Draft Controller] Could not replace editor text: {exc}")
+            return False
+
+    def _request_draft(self, price, force=False, is_repair=False):
+        """Set desired draft; all editor writes are serialized through here."""
+        if price is None:
+            # After Send, let Zalo clear the editor and only cancel the queued
+            # next draft. In every other state, remove a bot-owned stale draft
+            # once (for example when an opponent reaches max_price).
+            self.draft_expected_price = None
+            if self.draft_state == "WAIT_CLEAR":
+                self._set_draft_state("WAIT_CLEAR")
+                return
+            if self.draft_state != "EMPTY":
+                self.draft_ignore_until = time.monotonic() + 0.12
+                if not self._write_input_text(""):
+                    self._set_draft_state("ERROR")
+                    return
+            self.pre_typed_price = None
+            self.draft_candidate_text = None
+            self.draft_candidate_since = 0.0
+            self.draft_stable_frames = 0
+            self._set_draft_state("EMPTY")
+            return
+        if (not self.auto_bid_enabled or not self.auction_engine.is_active
+                or self.bid_send_in_progress or price <= 0 or price > self.config.max_price):
+            return
+
+        # While Zalo is clearing a sent message, remember the next desired value
+        # without touching the editor. EMPTY confirmation will resume preparation.
+        if self.draft_state == "WAIT_CLEAR":
+            self.draft_expected_price = price
+            self._set_draft_state("WAIT_CLEAR")
+            return
+        if (not force and self.draft_expected_price == price
+                and self.draft_state in ("PREPARING", "READY")):
+            return
+
+        desired_changed = self.draft_expected_price != price
+        self.draft_expected_price = price
+        self.pre_typed_price = None
+        self.draft_candidate_text = None
+        self.draft_candidate_since = 0.0
+        self.draft_stable_frames = 0
+        self.draft_mismatch_key = None
+        self.draft_mismatch_locked_logged = False
+        if desired_changed and not is_repair:
+            self.draft_repair_attempts = 0
+        self.draft_generation += 1
+        generation = self.draft_generation
+        self.draft_ignore_until = time.monotonic() + 0.12
+        self._set_draft_state("PREPARING")
+        if not self._write_input_text(str(price)):
+            self._set_draft_state("ERROR")
+            return
+        action = "Repair" if is_repair else "Prepared"
+        self.log(f"[Draft Controller] {action} {price}; observing Input OCR.")
+        QTimer.singleShot(1000, lambda g=generation: self._check_prepare_timeout(g))
+
+    def _chat_barrier_is_clear(self):
+        checker = getattr(self.ocr_worker, "has_unprocessed_chat_change", None)
+        return not callable(checker) or not checker()
+
+    def _try_dispatch_pending_bid(self):
+        if self.pending_bid_request is None or self.bid_send_in_progress:
+            return
+        price, timings = self.pending_bid_request
+        if self.draft_expected_price != price:
+            self._request_draft(price)
+            return
+        if not self._draft_is_ready(price) or not self._chat_barrier_is_clear():
+            return
+        self.pending_bid_request = None
+        QTimer.singleShot(0, lambda p=price, t=timings: self.trigger_bid_simulated(p, t))
+
     @Slot(str, float)
     def handle_input_text_detected(self, observed, observed_at):
         observed = "".join(ch for ch in (observed or "") if ch.isdigit())
+        self.draft_observed_text = observed
+        self.draft_observed_at = observed_at
+
+        # Ignore samples captured while our own Ctrl+A/write operation is still
+        # rendering. They are observations for display, not control decisions.
+        if observed_at < self.draft_ignore_until:
+            self._set_draft_state(self.draft_state)
+            return
+
         if observed == self.draft_candidate_text:
             self.draft_stable_frames += 1
         else:
             self.draft_candidate_text = observed
+            self.draft_candidate_since = observed_at
             self.draft_stable_frames = 1
-        self.draft_observed_text = observed
-        self.draft_observed_at = observed_at
 
-        if self.draft_state == "WAIT_CONFIRM":
+        if self.draft_state == "WAIT_CLEAR":
             if observed == "" and self.draft_stable_frames >= 2:
+                next_desired = self.draft_expected_price
+                self.draft_expected_price = None
                 self._set_draft_state("EMPTY")
-                queued = self.queued_prepare_price
-                self.queued_prepare_price = None
-                if queued is not None and self.auto_bid_enabled and self.auction_engine.is_active:
-                    QTimer.singleShot(0, lambda p=queued: self.pre_type_bid(p))
+                if next_desired is not None and self.auto_bid_enabled and self.auction_engine.is_active:
+                    QTimer.singleShot(0, lambda p=next_desired: self._request_draft(p, force=True))
             else:
-                self._set_draft_state("WAIT_CONFIRM")
+                self._set_draft_state("WAIT_CLEAR")
             return
 
         expected = self.draft_expected_price
         if expected is None:
-            self._set_draft_state("EMPTY" if observed == "" else "MISMATCH")
+            self._set_draft_state("EMPTY")
             return
         if observed == str(expected):
             if self.draft_stable_frames >= 2:
-                just_armed = self.draft_state != "ARMED"
                 self.draft_repair_attempts = 0
+                self.draft_mismatch_key = None
+                self.draft_mismatch_locked_logged = False
                 self.pre_typed_price = expected
-                self._set_draft_state("ARMED")
-                if just_armed and self.pending_bid_request:
-                    pending_price, pending_timings = self.pending_bid_request
-                    if pending_price == expected:
-                        self.pending_bid_request = None
-                        QTimer.singleShot(0, lambda p=pending_price, t=pending_timings: self.trigger_bid_simulated(p, t))
+                self._set_draft_state("READY")
+                self._try_dispatch_pending_bid()
             else:
                 self._set_draft_state("PREPARING")
             return
-        if self.draft_stable_frames < 2:
-            self._set_draft_state("PREPARING")
+
+        # A mismatch is an observation, never a terminal controller state.
+        self._set_draft_state("PREPARING")
+        mismatch_age = observed_at - self.draft_candidate_since
+        persistent = self.draft_stable_frames >= 4 and mismatch_age >= 0.10
+        if not persistent:
             return
-        previous_state = self.draft_state
-        self._set_draft_state("MISMATCH")
-        if previous_state != "MISMATCH":
-            self.log(f"[Draft Guard] Mismatch: OCR='{observed or '<EMPTY>'}', expected='{expected}'. Send blocked.")
-        if self.draft_repair_attempts < 2 and not self.bid_send_in_progress:
+
+        mismatch_key = (expected, observed)
+        if mismatch_key != self.draft_mismatch_key:
+            self.draft_mismatch_key = mismatch_key
+            self.log(
+                f"[Draft Controller] Persistent mismatch OCR='{observed or '<EMPTY>'}', "
+                f"expected='{expected}'. Send remains locked."
+            )
+
+        # Use the capture timestamp for all mismatch timing decisions. This
+        # keeps persistence and repair cooldown on the same clock even when an
+        # OCR sample waited briefly in the signal queue.
+        now = observed_at
+        if self.draft_repair_attempts < 2 and now - self.draft_last_repair_at >= 0.20:
             self.draft_repair_attempts += 1
-            QTimer.singleShot(0, lambda p=expected: self.pre_type_bid(p, force=True))
+            self.draft_last_repair_at = now
+            QTimer.singleShot(
+                0,
+                lambda p=expected: self._request_draft(p, force=True, is_repair=True),
+            )
+        elif self.draft_repair_attempts >= 2 and not self.draft_mismatch_locked_logged:
+            self.draft_mismatch_locked_logged = True
+            self.log("[Draft Controller] Repair limit reached; Send locked, monitoring continues.")
 
     def _check_prepare_timeout(self, generation):
-        if generation != self.draft_generation or self.draft_state == "ARMED":
+        if generation != self.draft_generation or self.draft_state == "READY":
             return
         if self.draft_expected_price is not None and self.auction_engine.is_active:
-            self.pending_bid_request = None
-            self._set_draft_state("ERROR")
-            self.toggle_auto_bid(False)
-            self.log("[Draft Guard] Draft was not verified in 1 second; Auto Bid disabled.")
+            self._set_draft_state("PREPARING")
+            self.log("[Draft Controller] Draft not READY after 1 second; Send locked, engine continues.")
 
     def _check_wait_confirm_timeout(self, generation):
-        if generation != self.wait_confirm_generation or self.draft_state != "WAIT_CONFIRM":
+        if generation != self.wait_confirm_generation or self.draft_state != "WAIT_CLEAR":
             return
-        self.queued_prepare_price = None
-        self._set_draft_state("ERROR")
-        self.toggle_auto_bid(False)
-        self.log("[Draft Guard] Input did not clear after Send; Auto Bid disabled.")
+        self.log("[Draft Controller] Input did not clear after Send; clearing once and continuing.")
+        self.draft_ignore_until = time.monotonic() + 0.12
+        if not self._write_input_text(""):
+            self._set_draft_state("ERROR")
 
     def _calculate_prepared_price(self, current_valid):
         """Price to keep in the editor while waiting for the next opponent bid."""
@@ -1128,18 +1250,16 @@ class MainWindow(QMainWindow):
         if self.indicator_overlay:
             self.indicator_overlay.set_current_price(current_valid)
             
-        # Pre-type the price we actually expect to bid next
+        # Publish one desired draft. Only the Draft Controller may mutate
+        # the editor; price updates never type directly.
         if self.auto_bid_enabled and not self.bid_send_in_progress and self.pending_bid_request is None:
             price_to_type = self._calculate_prepared_price(current_valid)
-
             if price_to_type is None:
-                self.queued_prepare_price = None
+                self._request_draft(None)
             else:
-                # Enforce start price constraint
                 price_to_type = max(price_to_type, self.config.start_price)
-
                 if price_to_type <= self.config.max_price:
-                    self.pre_type_bid(price_to_type)
+                    self._request_draft(price_to_type)
             
         # Draw and update the price timeline list on the right (Optimized: only redraw on value changes)
         timeline = getattr(self.auction_engine, "price_timeline", [])
@@ -1294,6 +1414,33 @@ class MainWindow(QMainWindow):
 
     @Slot(list, object)
     def handle_ocr_texts(self, texts, timings):
+        processed = False
+        try:
+            if isinstance(timings, dict) and timings.get("ocr_error"):
+                self.pending_bid_request = None
+                self.log(
+                    f"[Chat Controller] Skipped failed OCR frame: "
+                    f"{timings['ocr_error']}"
+                )
+            else:
+                self._process_ocr_texts(texts, timings)
+                processed = True
+        except Exception as exc:
+            # A malformed/failed frame is skipped. Never release a pending Send
+            # created by a partially processed frame, but keep the engine alive
+            # so the next captured change can be handled normally.
+            self.pending_bid_request = None
+            self.log(f"[Chat Controller] Skipped failed OCR frame: {exc}")
+        finally:
+            if isinstance(timings, dict):
+                generation = timings.get("chat_frame_generation")
+                marker = getattr(self.ocr_worker, "mark_chat_frame_consumed", None)
+                if callable(marker):
+                    marker(generation)
+        if processed:
+            self._try_dispatch_pending_bid()
+
+    def _process_ocr_texts(self, texts, timings):
         # 1. Get new raw lines using the robust LCS-based previous frame comparison
         new_raw_lines = []
         if isinstance(timings, dict) and "raw_lines" in timings:
@@ -1364,7 +1511,7 @@ class MainWindow(QMainWindow):
                 if new_prices:
                     new_prices.reverse() # Reverse because process_ocr_texts reverses it back
                     self.auction_engine.process_ocr_texts(new_prices, timings)
-        
+
     def refresh_time(self):
         # Update system realtime clock to align with logs timestamp (with milliseconds)
         offset_seconds = getattr(self.config, "manual_time_offset", 0)
@@ -1511,26 +1658,9 @@ class MainWindow(QMainWindow):
             self.toggle_auto_bid(True)
             self.btn_manual_bid.hide()
             
-        # Tự động kích hoạt tiêu điểm ô chat một lần duy nhất khi bấm START
-        try:
-            input_x, input_y, input_w, input_h = self.config.input_zone
-            if input_w <= 1 and input_h <= 1:
-                click_x = input_x
-                click_y = input_y
-            else:
-                click_x = input_x + input_w / 2
-                click_y = input_y + input_h / 2
-                
-            dpr = self.ocr_worker.device_pixel_ratio
-            cx = int(click_x * dpr)
-            cy = int(click_y * dpr)
-            win32_click(cx, cy)
-            time.sleep(0.005)
-            press_win32_hotkey(VK_CONTROL, VK_A)
-            press_win32_key(VK_BACK, False)
-            press_win32_key(VK_BACK, True)
-        except Exception as click_err:
-            self.log(f"[Lỗi Focus Click] Không thể tự động kích hoạt tiêu điểm: {click_err}")
+        # Start from a known empty editor through the single controller path.
+        if not self._write_input_text(""):
+            self.log("[Lỗi Focus Click] Không thể làm trống ô nhập khi START.")
         
     def restore_main_window(self):
         if self.indicator_overlay:
@@ -1824,50 +1954,67 @@ class MainWindow(QMainWindow):
             return
 
         is_fixed_schedule = self.config.bid_mode == "fixed_schedule"
-        if not is_fixed_schedule and not self._draft_is_armed(price):
-            if self.pending_bid_request is not None:
-                self.log(f"[Duplicate Guard] Another bid is awaiting verification; ignored {price}.")
-                return
-            self.pending_bid_request = (price, timings)
-            self.log(f"[Draft Guard] Waiting for Input OCR to verify {price} before Send.")
-            self.pre_type_bid(price, force=True)
-            return
         if self.bid_send_in_progress:
             self.log(f"[Duplicate Guard] A bid is being sent; ignored {price}.")
             return
 
-        # The draft may have been ARMED while a newer opponent price was being
-        # processed. Re-check the live engine state immediately before the
-        # synchronous Send action so a stale step can never be clicked.
-        if not is_fixed_schedule and not self._is_bid_price_still_valid(price):
-            current_price = self.auction_engine.current_price
-            expected_now = current_price + self.config.step_price if current_price > 0 else None
-            self.pending_bid_request = None
-            self.log(
-                f"[Final Guard] Blocked stale bid {price}; "
-                f"current={current_price}, expected={expected_now}."
-            )
+        if not is_fixed_schedule:
+            # Latest request wins. If the desired draft is already being prepared,
+            # attach pending Send without retyping the same value.
+            if not self._draft_is_ready(price):
+                previous = self.pending_bid_request[0] if self.pending_bid_request else None
+                self.pending_bid_request = (price, timings)
+                if previous is not None and previous != price:
+                    self.log(f"[Draft Controller] Pending updated {previous} -> {price}.")
+                self._request_draft(price)
+                return
 
-            replacement = self._calculate_prepared_price(current_price)
-            if replacement is not None:
-                replacement = max(replacement, self.config.start_price)
-                if replacement <= self.config.max_price:
-                    # If an opponent is currently highest, this replacement is
-                    # the immediate response that was missed while the stale
-                    # draft was being verified. Keep it pending until ARMED.
-                    if current_price != self.user_last_bid:
-                        self.pending_bid_request = (replacement, timings)
-                    self.pre_type_bid(replacement, force=True)
-                    return
+            # A newer chat image exists but AuctionEngine has not consumed it yet.
+            # Preserve the request and let handle_ocr_texts retry after consumption.
+            if not self._chat_barrier_is_clear():
+                self.pending_bid_request = (price, timings)
+                captured, consumed = (None, None)
+                getter = getattr(self.ocr_worker, "get_chat_generations", None)
+                if callable(getter):
+                    captured, consumed = getter()
+                self.log(
+                    f"[Chat Barrier] Send {price} deferred; "
+                    f"captured={captured}, consumed={consumed}."
+                )
+                return
 
-            # Target reached (or no further legal price): remove the stale
-            # bot-owned draft instead of leaving it in the Zalo editor.
-            self.clear_input_zone()
-            return
+            # Validate against the latest consumed engine price immediately before
+            # the synchronous Send action.
+            if not self._is_bid_price_still_valid(price):
+                current_price = self.auction_engine.current_price
+                expected_now = current_price + self.config.step_price if current_price > 0 else None
+                self.pending_bid_request = None
+                self.log(
+                    f"[Final Guard] Blocked stale bid {price}; "
+                    f"current={current_price}, expected={expected_now}."
+                )
+
+                replacement = self._calculate_prepared_price(current_price)
+                if replacement is not None:
+                    replacement = max(replacement, self.config.start_price)
+                    if replacement <= self.config.max_price:
+                        if current_price != self.user_last_bid:
+                            self.pending_bid_request = (replacement, timings)
+                        self._request_draft(
+                            replacement,
+                            force=self.draft_expected_price != replacement,
+                        )
+                        return
+                self.clear_input_zone()
+                return
+
+            # Re-check the barrier at the last possible point before clicking.
+            if not self._chat_barrier_is_clear():
+                self.pending_bid_request = (price, timings)
+                return
 
         self.bid_send_in_progress = True
         self.pending_bid_request = None
-        self._set_draft_state("SENDING")
         try:
             t_send_start = time.time()
             if is_fixed_schedule:
@@ -1881,8 +2028,7 @@ class MainWindow(QMainWindow):
                 press_win32_key(VK_BACK, True)
                 pyautogui.write(str(price), interval=0.0)
 
-            # OCR modes reach this point only when ARMED: the exact target is
-            # already present, so the critical path contains only Send.
+            # OCR modes arrive here only when READY and the chat barrier is clear.
             sbx, sby = self.config.send_btn
             if sbx > 0 and sby > 0:
                 dpr = self.ocr_worker.device_pixel_ratio
@@ -1894,11 +2040,14 @@ class MainWindow(QMainWindow):
             self.pre_typed_price = None
             self.draft_expected_price = None
             self.draft_candidate_text = None
+            self.draft_candidate_since = 0.0
             self.draft_stable_frames = 0
             self.wait_confirm_generation += 1
             wait_generation = self.wait_confirm_generation
-            self._set_draft_state("WAIT_CONFIRM")
-            if not is_fixed_schedule:
+            if is_fixed_schedule:
+                self._set_draft_state("EMPTY")
+            else:
+                self._set_draft_state("WAIT_CLEAR")
                 QTimer.singleShot(1200, lambda g=wait_generation: self._check_wait_confirm_timeout(g))
 
             send_ms = int((t_send_end - t_send_start) * 1000)
@@ -1926,43 +2075,8 @@ class MainWindow(QMainWindow):
             self.bid_finished_signal.emit(price, f"Send error: {str(e)}")
 
     def pre_type_bid(self, price, force=False):
-        """Replace the Zalo draft and wait for Input OCR before arming Send."""
-        if (not self.auto_bid_enabled or not self.auction_engine.is_active or self.bid_send_in_progress
-                or price <= 0 or price > self.config.max_price):
-            return
-        if self.draft_state == "WAIT_CONFIRM":
-            self.queued_prepare_price = price
-            return
-        if not force and self.draft_expected_price == price and self.draft_state in ("PREPARING", "ARMED"):
-            return
-        try:
-            ix, iy, iw, ih = self.config.input_zone
-            if ix <= 0 or iy <= 0:
-                self._set_draft_state("ERROR")
-                self.log("[Draft Guard] Zalo input point is not configured.")
-                return
-            self.draft_expected_price = price
-            self.pre_typed_price = None
-            self.draft_candidate_text = None
-            self.draft_stable_frames = 0
-            self.draft_generation += 1
-            generation = self.draft_generation
-            self._set_draft_state("PREPARING")
-            dpr = self.ocr_worker.device_pixel_ratio
-            win32_click(int(round((ix + iw // 2) * dpr)), int(round((iy + ih // 2) * dpr)))
-            time.sleep(0.005)
-            # Replacement is unconditional: never append to an unknown draft.
-            press_win32_hotkey(VK_CONTROL, VK_A)
-            press_win32_key(VK_BACK, False)
-            press_win32_key(VK_BACK, True)
-            pyautogui.write(str(price), interval=0.0)
-            self.log(f"[Pre-type] Prepared {price}; waiting for Input OCR verification.")
-            QTimer.singleShot(1000, lambda g=generation: self._check_prepare_timeout(g))
-        except Exception as e:
-            self.pre_typed_price = None
-            self.pending_bid_request = None
-            self._set_draft_state("ERROR")
-            self.log(f"[Pre-type] Could not prepare {price}: {str(e)}")
+        """Compatibility wrapper; Draft Controller is the sole editor owner."""
+        self._request_draft(price, force=force)
 
     @Slot(int, str)
     def on_bid_finished(self, price, status):
@@ -1980,22 +2094,19 @@ class MainWindow(QMainWindow):
             self.log(f"Bid {price} failed: {status}")
 
     def clear_input_zone(self):
-        """Clear a bot-owned draft and reset the deterministic controller."""
+        """Clear the bot-owned editor through the single controller path."""
         try:
-            owned = self.draft_state in ("PREPARING", "ARMED", "MISMATCH", "WAIT_CONFIRM", "ERROR")
+            owned = (
+                self.draft_state != "EMPTY"
+                or self.draft_expected_price is not None
+                or bool(self.draft_observed_text)
+            )
             if owned:
-                ix, iy, iw, ih = self.config.input_zone
-                if ix > 0 and iy > 0:
-                    dpr = self.ocr_worker.device_pixel_ratio
-                    win32_click(int(round((ix + iw // 2) * dpr)), int(round((iy + ih // 2) * dpr)))
-                    time.sleep(0.005)
-                    press_win32_hotkey(VK_CONTROL, VK_A)
-                    press_win32_key(VK_BACK, False)
-                    press_win32_key(VK_BACK, True)
+                self._write_input_text("")
             for key in ("ctrl", "shift", "alt", "win"):
                 pyautogui.keyUp(key)
             self._reset_draft_controller()
-            self.log("[Draft Guard] Bot draft cleared and state reset.")
+            self.log("[Draft Controller] Bot draft cleared and state reset.")
         except Exception as e:
             self._set_draft_state("ERROR")
             self.log(f"Input cleanup error: {str(e)}")

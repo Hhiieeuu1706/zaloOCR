@@ -271,11 +271,9 @@ class IndicatorOverlay(QWidget):
                 break
 
         state_colors = {
-            "ARMED": QColor(0, 255, 102),
+            "READY": QColor(0, 255, 102),
             "PREPARING": QColor(255, 183, 3),
-            "SENDING": QColor(0, 210, 255),
-            "WAIT_CONFIRM": QColor(0, 210, 255),
-            "MISMATCH": QColor(255, 51, 51),
+            "WAIT_CLEAR": QColor(0, 210, 255),
             "ERROR": QColor(255, 51, 51),
             "EMPTY": QColor(170, 170, 180),
         }

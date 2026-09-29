@@ -88,6 +88,11 @@ class OCRWorker(QThread):
                 self.device_pixel_ratio = 1.0
             
         self.frame_queue = queue.Queue(maxsize=1)
+        # Chat capture and GUI consumption advance independently. A bid may be
+        # sent only when every captured change has been consumed by the engine.
+        self._chat_generation_lock = threading.Lock()
+        self._chat_captured_generation = 0
+        self._chat_consumed_generation = 0
         self.input_ocr_thread = None
         self.input_tesseract_handle = None
         self._input_tess_lock = threading.Lock()
@@ -455,6 +460,9 @@ class OCRWorker(QThread):
 
     def start_capturing(self):
         self.prev_img = None
+        with self._chat_generation_lock:
+            self._chat_captured_generation = 0
+            self._chat_consumed_generation = 0
         self.is_capturing = True
         try:
             x, y, w, h = self.config.chat_zone
@@ -469,6 +477,20 @@ class OCRWorker(QThread):
         
     def stop_capturing(self):
         self.is_capturing = False
+
+    def mark_chat_frame_consumed(self, generation):
+        if not isinstance(generation, int):
+            return
+        with self._chat_generation_lock:
+            self._chat_consumed_generation = max(self._chat_consumed_generation, generation)
+
+    def has_unprocessed_chat_change(self):
+        with self._chat_generation_lock:
+            return self._chat_captured_generation > self._chat_consumed_generation
+
+    def get_chat_generations(self):
+        with self._chat_generation_lock:
+            return self._chat_captured_generation, self._chat_consumed_generation
         
     def stop(self):
         self.running = False
@@ -574,12 +596,15 @@ class OCRWorker(QThread):
                         # ===== OCR queueing (Continuous) =====
                         if has_change:
                             t_capture_end = time.time()
+                            with self._chat_generation_lock:
+                                self._chat_captured_generation += 1
+                                chat_generation = self._chat_captured_generation
                             if self.frame_queue.full():
                                 try:
                                     self.frame_queue.get_nowait()
                                 except queue.Empty:
                                     pass
-                            self.frame_queue.put_nowait((ocr_img, start_time, t_capture_end))
+                            self.frame_queue.put_nowait((ocr_img, start_time, t_capture_end, chat_generation))
                     
                 except Exception as e:
                     self.debug_log.emit(f"[Lỗi Capture] {str(e)}")
@@ -665,12 +690,13 @@ class OCRWorker(QThread):
     def _ocr_processing_loop(self):
         """Background thread loop for running OCR on captured frames."""
         while self.running:
+            chat_generation = None
             try:
                 # Block wait for a frame (up to 100ms)
                 item = self.frame_queue.get(timeout=0.1)
                 if item is None:
                     continue
-                ocr_img, start_time, t_capture_end = item
+                ocr_img, start_time, t_capture_end, chat_generation = item
                 t_ocr_start = time.time()
                 
                 texts = []
@@ -698,32 +724,36 @@ class OCRWorker(QThread):
                 
                 t_ocr_end = time.time()
                 
-                # Print debug to UI console about processed GE results
-                if texts:
-                    timings = {
-                        "capture_start": start_time,
-                        "capture_duration_ms": int((t_capture_end - start_time) * 1000),
-                        "queue_duration_ms": int((t_ocr_start - t_capture_end) * 1000),
-                        "ocr_duration_ms": int((t_ocr_end - t_ocr_start) * 1000),
-                        "raw_lines": raw_lines,
-                    }
-                    self.text_detected.emit(texts, timings)
-                else:
-                    # Even if no valid prices, emit raw lines for history/context update if raw_lines exist
-                    if raw_lines:
-                        timings = {
-                            "capture_start": start_time,
-                            "capture_duration_ms": int((t_capture_end - start_time) * 1000),
-                            "queue_duration_ms": int((t_ocr_start - t_capture_end) * 1000),
-                            "ocr_duration_ms": int((t_ocr_end - t_ocr_start) * 1000),
-                            "raw_lines": raw_lines,
-                        }
-                        self.text_detected.emit([], timings)
+                # Every changed frame is acknowledged by the GUI, including
+                # frames with no OCR text, so the pre-send barrier cannot stick.
+                timings = {
+                    "capture_start": start_time,
+                    "capture_duration_ms": int((t_capture_end - start_time) * 1000),
+                    "queue_duration_ms": int((t_ocr_start - t_capture_end) * 1000),
+                    "ocr_duration_ms": int((t_ocr_end - t_ocr_start) * 1000),
+                    "raw_lines": raw_lines,
+                    "chat_frame_generation": chat_generation,
+                }
+                self.text_detected.emit(texts, timings)
                     
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"[OCR Processing Thread Error] {e}")
+                # Do not leave the GUI's pre-send generation barrier locked
+                # forever when one OCR frame fails. Emit an empty result for
+                # that exact generation; the controller will skip it safely.
+                if chat_generation is not None:
+                    t_error_end = time.time()
+                    self.text_detected.emit([], {
+                        "capture_start": start_time,
+                        "capture_duration_ms": int((t_capture_end - start_time) * 1000),
+                        "queue_duration_ms": 0,
+                        "ocr_duration_ms": int((t_error_end - t_ocr_start) * 1000),
+                        "raw_lines": [],
+                        "chat_frame_generation": chat_generation,
+                        "ocr_error": str(e),
+                    })
 
     def generate_mock_texts(self):
         return []
